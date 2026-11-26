@@ -9,7 +9,7 @@ export async function GET(request: Request) {
     return NextResponse.json({ error: 'Sesi admin tidak valid.' }, { status: 401 })
   }
   try {
-    return NextResponse.json(getDrilldownData(new URL(request.url).searchParams))
+    return NextResponse.json(await getDrilldownData(new URL(request.url).searchParams))
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Data drill down gagal dimuat.'
     return NextResponse.json({ error: message }, { status: 400 })

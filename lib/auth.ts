@@ -5,8 +5,9 @@ import { getDatabase } from './database'
 export const SESSION_COOKIE = 'ncr_admin_session'
 const SESSION_TTL_SECONDS = 60 * 60 * 8
 
-export function verifyAdmin(username: string, password: string) {
-  const admin = getDatabase().prepare(
+export async function verifyAdmin(username: string, password: string) {
+  const database = await getDatabase()
+  const admin = await database.prepare(
     'SELECT username, salt, password_hash FROM admins WHERE id = 1',
   ).get() as { username: string; salt: string; password_hash: string } | undefined
   if (!admin || admin.username !== username) return false
@@ -15,22 +16,23 @@ export function verifyAdmin(username: string, password: string) {
   return expected.length === actual.length && timingSafeEqual(expected, actual)
 }
 
-function sessionSecret() {
-  const db = getDatabase()
-  let setting = db.prepare("SELECT value FROM settings WHERE key = 'session_secret'").get() as { value: string } | undefined
+async function sessionSecret() {
+  const db = await getDatabase()
+  let setting = await db.prepare("SELECT value FROM settings WHERE key = 'session_secret'").get() as { value: string } | undefined
   if (!setting) {
     const value = randomBytes(32).toString('hex')
-    db.prepare("INSERT INTO settings (key, value) VALUES ('session_secret', ?)").run(value)
-    setting = { value }
+    await db.prepare("INSERT INTO settings (key, value) VALUES ('session_secret', ?) ON CONFLICT (key) DO NOTHING").run(value)
+    setting = await db.prepare("SELECT value FROM settings WHERE key = 'session_secret'").get() as { value: string } | undefined
   }
+  if (!setting) throw new Error('Rahasia sesi tidak dapat disimpan.')
   return setting.value
 }
 
-export function createSessionToken() {
+export async function createSessionToken() {
   const expires = Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS
   const nonce = randomBytes(16).toString('hex')
   const payload = `admin:${expires}:${nonce}`
-  const signature = createHmac('sha256', sessionSecret()).update(payload).digest('hex')
+  const signature = createHmac('sha256', await sessionSecret()).update(payload).digest('hex')
   return { token: `${payload}:${signature}`, maxAge: SESSION_TTL_SECONDS }
 }
 
@@ -43,7 +45,7 @@ export async function hasAdminSession() {
     return false
   }
   const payload = `${role}:${expiresText}:${nonce}`
-  const expected = createHmac('sha256', sessionSecret()).update(payload).digest()
+  const expected = createHmac('sha256', await sessionSecret()).update(payload).digest()
   let received: Buffer
   try {
     received = Buffer.from(signature, 'hex')

@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto'
-import type { DatabaseSync } from 'node:sqlite'
+import { getDatabase } from './database'
 
 const columns = [
   'booking_id', 'booking_date', 'booking_time', 'booking_status', 'customer_id',
@@ -29,7 +29,7 @@ const databaseHeaders = [
 const statementSql = `INSERT INTO rides (${columns.join(', ')})
   VALUES (${columns.map(() => '?').join(', ')})`
 
-function parseRecords(text: string, onRecord: (record: string[]) => void) {
+async function parseRecords(text: string, onRecord: (record: string[]) => void | Promise<void>) {
   const source = text.charCodeAt(0) === 0xfeff ? text.slice(1) : text
   let record: string[] = []
   let field = ''
@@ -57,7 +57,7 @@ function parseRecords(text: string, onRecord: (record: string[]) => void) {
     } else if (char === '\n' || char === '\r') {
       if (char === '\r' && source[i + 1] === '\n') i++
       record.push(field)
-      if (record.some(value => value.length > 0)) onRecord(record)
+      if (record.some(value => value.length > 0)) await onRecord(record)
       record = []
       field = ''
       atFieldStart = true
@@ -69,7 +69,7 @@ function parseRecords(text: string, onRecord: (record: string[]) => void) {
 
   if (field.length > 0 || record.length > 0) {
     record.push(field)
-    if (record.some(value => value.length > 0)) onRecord(record)
+    if (record.some(value => value.length > 0)) await onRecord(record)
   }
   if (quoted) throw new Error('CSV memiliki tanda kutip yang tidak berpasangan.')
 }
@@ -123,31 +123,36 @@ function parseBookingRecord(record: string[], rowNumber: number) {
 
 export type ImportMode = 'replace' | 'append'
 
-export function importCsv(db: DatabaseSync, text: string, source: string, mode: ImportMode = 'replace') {
+type Database = Awaited<ReturnType<typeof getDatabase>>
+
+export async function importCsv(db: Database, text: string, source: string, mode: ImportMode = 'replace') {
   let headerSeen = false
   let rowNumber = 0
   let imported = 0
   let skipped = 0
-  const insert = db.prepare(statementSql)
-  const recordImport = db.prepare(
-    'INSERT INTO dataset_imports (source, row_count, checksum) VALUES (?, ?, ?)',
-  )
-
-  db.exec('BEGIN IMMEDIATE')
-  try {
+  return db.transaction(async transaction => {
     // Abaikan Booking ID yang sudah tersimpan atau berulang di berkas yang sama.
     const knownIds = new Set(
       mode === 'append'
-        ? (db.prepare('SELECT booking_id FROM rides').all() as { booking_id: string }[]).map(r => r.booking_id)
+        ? (await transaction.prepare('SELECT booking_id FROM rides').all() as { booking_id: string }[]).map(r => r.booking_id)
         : [],
     )
-    parseRecords(text, record => {
+    let batch: (string | number | null)[][] = []
+    const flushBatch = async () => {
+      if (batch.length === 0) return
+      const placeholders = batch.map(() => `(${columns.map(() => '?').join(', ')})`).join(', ')
+      await transaction.prepare(`INSERT INTO rides (${columns.join(', ')}) VALUES ${placeholders}`)
+        .run(...batch.flat())
+      batch = []
+    }
+
+    await parseRecords(text, async record => {
       rowNumber++
       if (!headerSeen) {
         const problem = headerError(record)
         if (problem) throw new Error(problem)
         headerSeen = true
-        if (mode === 'replace') db.exec('DELETE FROM rides')
+        if (mode === 'replace') await transaction.exec('DELETE FROM rides')
         return
       }
 
@@ -156,8 +161,9 @@ export function importCsv(db: DatabaseSync, text: string, source: string, mode: 
       if (knownIds.has(id)) { skipped++; return }
       knownIds.add(id)
       const ordered = databaseHeaders.map(header => values[headersIndex(header)])
-      insert.run(...ordered)
+      batch.push(ordered)
       imported++
+      if (batch.length >= 500) await flushBatch()
     })
 
     if (!headerSeen) throw new Error('CSV tidak memiliki baris pemesanan untuk diimpor.')
@@ -166,14 +172,13 @@ export function importCsv(db: DatabaseSync, text: string, source: string, mode: 
         ? `Semua ${skipped.toLocaleString('id-ID')} baris sudah ada di database (Booking ID sama). Tidak ada data baru yang ditambahkan.`
         : 'CSV tidak memiliki baris pemesanan untuk diimpor.')
     }
-    recordImport.run(mode === 'append' ? `${source} (tambah)` : source, imported, createHash('sha256').update(text).digest('hex'))
-    const { totalRows, latestDate } = refreshMetadata(db)
-    db.exec('COMMIT')
+    await flushBatch()
+    await transaction.prepare(
+      'INSERT INTO dataset_imports (source, row_count, checksum) VALUES (?, ?, ?)',
+    ).run(mode === 'append' ? `${source} (tambah)` : source, imported, createHash('sha256').update(text).digest('hex'))
+    const { totalRows, latestDate } = await refreshMetadata(transaction)
     return { mode, rowCount: imported, skipped, totalRows, latestDate }
-  } catch (error) {
-    db.exec('ROLLBACK')
-    throw error
-  }
+  })
 }
 
 export type AnalysisSample = {
@@ -190,8 +195,8 @@ const MAX_SAMPLES = 12
 
 // Langkah 1 ETL: membaca & memeriksa CSV tanpa mengubah database sedikit pun.
 // Hasilnya dipakai untuk menentukan lanjut ke Timpa, Tambah (import), atau Input Manual.
-export function analyzeCsv(db: DatabaseSync, text: string) {
-  const existing = new Set((db.prepare('SELECT booking_id FROM rides').all() as { booking_id: string }[]).map(r => r.booking_id))
+export async function analyzeCsv(db: Database, text: string) {
+  const existing = new Set((await db.prepare('SELECT booking_id FROM rides').all() as { booking_id: string }[]).map(r => r.booking_id))
   const seenInFile = new Set<string>()
   const statusCounts: Record<string, number> = {}
   const errors: { row: number; message: string }[] = []
@@ -209,7 +214,7 @@ export function analyzeCsv(db: DatabaseSync, text: string) {
 
   const idx = (header: string) => headersIndex(header)
   try {
-    parseRecords(text, record => {
+    await parseRecords(text, record => {
       rowNumber++
       if (!headerSeen) {
         headerSeen = true
@@ -272,48 +277,38 @@ function headersIndex(header: string) {
 }
 
 // Menyegarkan jumlah baris & tanggal terbaru. Dipanggil setiap data berubah.
-export function refreshMetadata(db: DatabaseSync) {
-  const stats = db.prepare('SELECT COUNT(*) AS total, MAX(booking_date) AS latest FROM rides').get() as
+export async function refreshMetadata(db: Database) {
+  const stats = await db.prepare('SELECT COUNT(*) AS total, MAX(booking_date) AS latest FROM rides').get() as
     { total: number; latest: string | null }
   const totalRows = Number(stats.total)
   const latestDate = stats.latest ?? ''
-  db.prepare("INSERT OR REPLACE INTO metadata (key, value) VALUES ('row_count', ?)").run(String(totalRows))
-  db.prepare("INSERT OR REPLACE INTO metadata (key, value) VALUES ('latest_date', ?)").run(latestDate)
+  await db.prepare("INSERT INTO metadata (key, value) VALUES ('row_count', ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value").run(String(totalRows))
+  await db.prepare("INSERT INTO metadata (key, value) VALUES ('latest_date', ?) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value").run(latestDate)
   return { totalRows, latestDate }
 }
 
-export function clearDataset(db: DatabaseSync) {
-  db.exec('BEGIN IMMEDIATE')
-  try {
-    const deletedRows = Number(db.prepare('SELECT COUNT(*) AS total FROM rides').get()?.total ?? 0)
-    db.exec('DELETE FROM rides; DELETE FROM dataset_imports; DELETE FROM metadata;')
-    const { totalRows, latestDate } = refreshMetadata(db)
-    db.exec('COMMIT')
+export async function clearDataset(db: Database) {
+  return db.transaction(async transaction => {
+    const deletedRows = Number((await transaction.prepare('SELECT COUNT(*) AS total FROM rides').get())?.total ?? 0)
+    await transaction.exec('DELETE FROM rides; DELETE FROM dataset_imports; DELETE FROM metadata;')
+    const { totalRows, latestDate } = await refreshMetadata(transaction)
     return { deletedRows, totalRows, latestDate }
-  } catch (error) {
-    db.exec('ROLLBACK')
-    throw error
-  }
+  })
 }
 
-export function deleteSelectedRides(db: DatabaseSync, rideIds: number[]) {
+export async function deleteSelectedRides(db: Database, rideIds: number[]) {
   if (rideIds.length === 0 || rideIds.length > 1000 ||
       rideIds.some(id => !Number.isSafeInteger(id) || id <= 0)) {
     throw new Error('Daftar pemesanan yang dipilih tidak valid.')
   }
 
   const ids = [...new Set(rideIds)]
-  db.exec('BEGIN IMMEDIATE')
-  try {
+  return db.transaction(async transaction => {
     const placeholders = ids.map(() => '?').join(', ')
-    const deletedRows = Number(db.prepare(`DELETE FROM rides WHERE ride_id IN (${placeholders})`).run(...ids).changes)
-    const { totalRows, latestDate } = refreshMetadata(db)
-    db.exec('COMMIT')
+    const deletedRows = Number((await transaction.prepare(`DELETE FROM rides WHERE ride_id IN (${placeholders})`).run(...ids)).changes)
+    const { totalRows, latestDate } = await refreshMetadata(transaction)
     return { deletedRows, totalRows, latestDate }
-  } catch (error) {
-    db.exec('ROLLBACK')
-    throw error
-  }
+  })
 }
 
 export const BOOKING_STATUSES = [
@@ -338,7 +333,7 @@ function number(value: unknown, label: string, min: number, max: number) {
 }
 
 // Input manual (satu baris pemesanan) lewat form. Validasi mengikuti aturan yang sama dengan impor CSV.
-export function insertManualRide(db: DatabaseSync, input: ManualRideInput) {
+export async function insertManualRide(db: Database, input: ManualRideInput) {
   const id = bookingId(text(input.booking_id))
   const date = text(input.booking_date)
   const time = text(input.booking_time)
@@ -371,9 +366,8 @@ export function insertManualRide(db: DatabaseSync, input: ManualRideInput) {
     throw new Error('Alasan pembatalan / ketidaklengkapan wajib diisi untuk status ini.')
   }
 
-  db.exec('BEGIN IMMEDIATE')
-  try {
-    if (db.prepare('SELECT 1 FROM rides WHERE booking_id = ? LIMIT 1').get(id)) {
+  return db.transaction(async transaction => {
+    if (await transaction.prepare('SELECT 1 FROM rides WHERE booking_id = ? LIMIT 1').get(id)) {
       throw new Error(`Booking ID ${id} sudah ada di database.`)
     }
     const byCustomer = status === 'Cancelled by Customer'
@@ -388,14 +382,10 @@ export function insertManualRide(db: DatabaseSync, input: ManualRideInput) {
       incomplete ? 1 : null, incomplete ? reason : null,
       bookingValue, distance, driverRating, customerRating, payment || null,
     ]
-    db.prepare(statementSql).run(...row)
-    db.prepare('INSERT INTO dataset_imports (source, row_count, checksum) VALUES (?, ?, ?)')
+    await transaction.prepare(statementSql).run(...row)
+    await transaction.prepare('INSERT INTO dataset_imports (source, row_count, checksum) VALUES (?, ?, ?)')
       .run('input-manual', 1, createHash('sha256').update(JSON.stringify(row)).digest('hex'))
-    const { totalRows, latestDate } = refreshMetadata(db)
-    db.exec('COMMIT')
+    const { totalRows, latestDate } = await refreshMetadata(transaction)
     return { bookingId: id, totalRows, latestDate }
-  } catch (error) {
-    db.exec('ROLLBACK')
-    throw error
-  }
+  })
 }

@@ -25,7 +25,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    return NextResponse.json(deleteSelectedRides(getDatabase(), rideIds))
+    return NextResponse.json(await deleteSelectedRides(await getDatabase(), rideIds))
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Baris yang dipilih gagal dihapus.'
     return NextResponse.json({ error: message }, { status: 500 })

@@ -9,7 +9,7 @@ export async function POST() {
   if (!await hasAdminSession()) return NextResponse.json({ error: 'Sesi admin tidak valid.' }, { status: 401 })
 
   try {
-    return NextResponse.json(clearDataset(getDatabase()))
+    return NextResponse.json(await clearDataset(await getDatabase()))
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Dataset gagal dihapus.'
     return NextResponse.json({ error: message }, { status: 500 })

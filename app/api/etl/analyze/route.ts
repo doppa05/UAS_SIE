@@ -17,8 +17,8 @@ export async function POST(request: Request) {
   if (file.size === 0 || file.size > 50 * 1024 * 1024) {
     return NextResponse.json({ error: 'Ukuran berkas harus lebih dari 0 dan tidak melebihi 50 MB.' }, { status: 400 })
   }
-  const db = getDatabase()
-  const analysis = analyzeCsv(db, await file.text())
-  const existingRows = Number(db.prepare('SELECT COUNT(*) AS c FROM rides').get()?.c ?? 0)
+  const db = await getDatabase()
+  const analysis = await analyzeCsv(db, await file.text())
+  const existingRows = Number((await db.prepare('SELECT COUNT(*) AS c FROM rides').get())?.c ?? 0)
   return NextResponse.json({ ...analysis, fileName: file.name, fileSize: file.size, databaseRows: existingRows })
 }

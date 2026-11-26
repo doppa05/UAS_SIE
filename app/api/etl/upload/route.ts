@@ -27,7 +27,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    const result = importCsv(getDatabase(), await file.text(), file.name, mode)
+    const result = await importCsv(await getDatabase(), await file.text(), file.name, mode)
     return NextResponse.json({ ...result, fileName: file.name })
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Proses impor CSV gagal.'

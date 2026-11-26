@@ -33,7 +33,7 @@ export async function POST(request: Request) {
   }
 
   try {
-    return NextResponse.json(insertManualRide(getDatabase(), body))
+    return NextResponse.json(await insertManualRide(await getDatabase(), body))
   } catch (error) {
     const message = error instanceof Error ? error.message : 'Data gagal disimpan.'
     return NextResponse.json({ error: message }, { status: 400 })

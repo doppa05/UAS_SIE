@@ -7,9 +7,10 @@ export const runtime = 'nodejs'
 
 export async function GET() {
   if (!await hasAdminSession()) return NextResponse.json({ authenticated: false })
-  const count = Number(getDatabase().prepare('SELECT COUNT(*) AS count FROM rides').get()?.count ?? 0)
-  const latestDate = String(getDatabase().prepare("SELECT value FROM metadata WHERE key = 'latest_date'").get()?.value ?? '')
-  const dashboard = getDashboardData(new URLSearchParams())
+  const database = await getDatabase()
+  const count = Number((await database.prepare('SELECT COUNT(*) AS count FROM rides').get())?.count ?? 0)
+  const latestDate = String((await database.prepare("SELECT value FROM metadata WHERE key = 'latest_date'").get())?.value ?? '')
+  const dashboard = await getDashboardData(new URLSearchParams())
   return NextResponse.json({
     authenticated: true,
     username: process.env.ADMIN_USERNAME || 'admin',

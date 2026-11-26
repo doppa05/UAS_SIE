@@ -77,12 +77,12 @@ function blankAgg(vehicles: string[], payments: string[]): Agg {
   }
 }
 
-function groupedRows(start: string, end: string, version: number) {
-  const db = getDatabase()
+async function groupedRows(start: string, end: string, version: number) {
+  const db = await getDatabase()
   const key = `${version}:${start}:${end}`
   const cached = groupedCache.get(key)
   if (cached) return cached
-  const grouped = db.prepare(`
+  const grouped = await db.prepare(`
     SELECT ${STATUS_SQL} AS status, ${VEHICLE_SQL} AS vehicle, ${PAYMENT_SQL} AS payment,
       COUNT(*) AS total,
       SUM(CASE WHEN ${STATUS_SQL} = 'Selesai' THEN 1 ELSE 0 END) AS completed,
@@ -141,13 +141,13 @@ function aggregate(grouped: DatabaseRow[], filters: Filters, vehicles: string[],
   return agg
 }
 
-function repeatBookingShare(filters: Filters, start: string, end: string, total: number, version: number) {
+async function repeatBookingShare(filters: Filters, start: string, end: string, total: number, version: number) {
   if (!total) return 0
   const key = `${version}:${start}:${end}:${filters.status}:${filters.vehicle}:${filters.payment}`
   const cached = repeatCache.get(key)
   if (cached !== undefined) return cached
   const { where, values } = conditions(filters, start, end)
-  const repeat = getDatabase().prepare(`
+  const repeat = await (await getDatabase()).prepare(`
     SELECT COALESCE(SUM(customer_bookings), 0) AS repeat_bookings FROM (
       SELECT COUNT(*) AS customer_bookings FROM rides
       WHERE ${where} AND customer_id IS NOT NULL
@@ -160,9 +160,9 @@ function repeatBookingShare(filters: Filters, start: string, end: string, total:
   return share
 }
 
-function getSeries(filters: Filters, range: Range, latestDate: string, start: string, end: string, metric: 'bookings' | 'revenue') {
+async function getSeries(filters: Filters, range: Range, latestDate: string, start: string, end: string, metric: 'bookings' | 'revenue') {
   const { where, values } = conditions(filters, start, end)
-  const rows = getDatabase().prepare(`
+  const rows = await (await getDatabase()).prepare(`
     SELECT booking_date AS date, COUNT(*) AS bookings,
       SUM(CASE WHEN ${STATUS_SQL} = 'Selesai' THEN COALESCE(booking_value, 0) ELSE 0 END) AS revenue
     FROM rides WHERE ${where} GROUP BY booking_date ORDER BY booking_date
@@ -225,14 +225,14 @@ function formatRow(row: DatabaseRow): Row {
   }
 }
 
-export function getDashboardData(params: URLSearchParams) {
-  const db = getDatabase()
-  const latestDate = String(db.prepare("SELECT value FROM metadata WHERE key = 'latest_date'").get()?.value ?? '')
-  const totalRows = Number(db.prepare('SELECT COUNT(*) AS count FROM rides').get()?.count ?? 0)
-  const datasetVersion = Number(db.prepare('SELECT COALESCE(MAX(id), 0) AS version FROM dataset_imports').get()?.version ?? 0)
-  const vehicleOptions = (db.prepare(`SELECT DISTINCT ${VEHICLE_SQL} AS value FROM rides ORDER BY value`).all() as DatabaseRow[])
+export async function getDashboardData(params: URLSearchParams) {
+  const db = await getDatabase()
+  const latestDate = String((await db.prepare("SELECT value FROM metadata WHERE key = 'latest_date'").get())?.value ?? '')
+  const totalRows = Number((await db.prepare('SELECT COUNT(*) AS count FROM rides').get())?.count ?? 0)
+  const datasetVersion = Number((await db.prepare('SELECT COALESCE(MAX(id), 0) AS version FROM dataset_imports').get())?.version ?? 0)
+  const vehicleOptions = (await db.prepare(`SELECT DISTINCT ${VEHICLE_SQL} AS value FROM rides ORDER BY value`).all() as DatabaseRow[])
     .map(row => String(row.value))
-  const paymentOptions = (db.prepare(`SELECT DISTINCT ${PAYMENT_SQL} AS value FROM rides ORDER BY value`).all() as DatabaseRow[])
+  const paymentOptions = (await db.prepare(`SELECT DISTINCT ${PAYMENT_SQL} AS value FROM rides ORDER BY value`).all() as DatabaseRow[])
     .map(row => String(row.value))
   const rangeValue = params.get('range')
   const range: Range = isRange(rangeValue) ? rangeValue : DEFAULT_FILTERS.range
@@ -265,8 +265,8 @@ export function getDashboardData(params: URLSearchParams) {
     ? null
     : { start: previousStart, end: previousEnd }
   const filtersWithoutRange = filters
-  const currentGroups = groupedRows(start, end, datasetVersion)
-  const previousGroups = previousFilters ? groupedRows(previousFilters.start, previousFilters.end, datasetVersion) : null
+  const currentGroups = await groupedRows(start, end, datasetVersion)
+  const previousGroups = previousFilters ? await groupedRows(previousFilters.start, previousFilters.end, datasetVersion) : null
   const aggAllStatus = aggregate(currentGroups, { ...filtersWithoutRange, status: 'all' }, vehicleOptions, paymentOptions)
   const prevAllStatus = previousGroups && previousFilters
     ? aggregate(previousGroups, { ...filtersWithoutRange, status: 'all' }, vehicleOptions, paymentOptions)
@@ -275,16 +275,16 @@ export function getDashboardData(params: URLSearchParams) {
   const prev = previousFilters && previousGroups
     ? aggregate(previousGroups, filters, vehicleOptions, paymentOptions, prevAllStatus?.avgFare)
     : null
-  agg.repeat = repeatBookingShare(filters, start, end, agg.total, datasetVersion)
+  agg.repeat = await repeatBookingShare(filters, start, end, agg.total, datasetVersion)
   if (prev && previousFilters) {
-    prev.repeat = repeatBookingShare(filters, previousFilters.start, previousFilters.end, prev.total, datasetVersion)
+    prev.repeat = await repeatBookingShare(filters, previousFilters.start, previousFilters.end, prev.total, datasetVersion)
   }
   const aggAllVehicle = aggregate(currentGroups, { ...filtersWithoutRange, vehicle: 'all' }, vehicleOptions, paymentOptions)
   const aggAllPayment = aggregate(currentGroups, { ...filtersWithoutRange, payment: 'all' }, vehicleOptions, paymentOptions)
-  const bookingSeries = getSeries(filters, range, latestDate, start, end, 'bookings')
-  const revenueSeries = getSeries(filters, range, latestDate, start, end, 'revenue')
+  const bookingSeries = await getSeries(filters, range, latestDate, start, end, 'bookings')
+  const revenueSeries = await getSeries(filters, range, latestDate, start, end, 'revenue')
   const { where, values } = conditions(filters, start, end)
-  const reasonRows = db.prepare(`
+  const reasonRows = await db.prepare(`
     SELECT status, label, SUM(total) AS value FROM (
       SELECT 'Dibatalkan pengemudi' AS status, trim(cancel_driver_reason) AS label, COUNT(*) AS total
       FROM rides WHERE ${where} AND cancel_driver_reason IS NOT NULL AND lower(trim(cancel_driver_reason)) != 'null'
@@ -297,7 +297,7 @@ export function getDashboardData(params: URLSearchParams) {
   `).all(...values, ...values) as DatabaseRow[]
   const reasons = reasonRows.map(row => ({ label: String(row.label), value: Number(row.value), status: String(row.status) }))
   // Data tambahan untuk insight otomatis: jam tersibuk & titik jemput terbanyak pada filter aktif.
-  const hourRows = db.prepare(`
+  const hourRows = await db.prepare(`
     SELECT substr(booking_time, 1, 2) AS hour, COUNT(*) AS total FROM rides
     WHERE ${where} AND booking_time IS NOT NULL AND length(booking_time) >= 2
     GROUP BY hour ORDER BY total DESC, hour ASC
@@ -306,7 +306,7 @@ export function getDashboardData(params: URLSearchParams) {
   const peakHour = hourRows.length && Number.isFinite(Number(hourRows[0].hour))
     ? { hour: Number(hourRows[0].hour), count: Number(hourRows[0].total), share: timedTotal ? Number(hourRows[0].total) / timedTotal : 0 }
     : null
-  const pickupRow = db.prepare(`
+  const pickupRow = await db.prepare(`
     SELECT trim(pickup_location) AS label, COUNT(*) AS total FROM rides
     WHERE ${where} AND pickup_location IS NOT NULL AND trim(pickup_location) != '' AND lower(trim(pickup_location)) != 'null'
     GROUP BY label ORDER BY total DESC, label ASC LIMIT 1
@@ -316,7 +316,7 @@ export function getDashboardData(params: URLSearchParams) {
   const page = Math.max(1, Math.min(100000, Number(params.get('page')) || 1))
   const searchClause = search ? ' AND booking_id LIKE ?' : ''
   const countParams = search ? [...values, `%${search}%`] : values
-  const rowCount = Number(db.prepare(`SELECT COUNT(*) AS count FROM rides WHERE ${where}${searchClause}`).get(...countParams)?.count ?? 0)
+  const rowCount = Number((await db.prepare(`SELECT COUNT(*) AS count FROM rides WHERE ${where}${searchClause}`).get(...countParams))?.count ?? 0)
   const sort = params.get('sort')
   const sortSql: Record<string, string> = {
     id: 'booking_id',
@@ -328,7 +328,7 @@ export function getDashboardData(params: URLSearchParams) {
   }
   const order = sortSql[sort ?? 'ts'] ?? sortSql.ts
   const direction = params.get('direction') === 'asc' ? 'ASC' : 'DESC'
-  const rows = db.prepare(`
+  const rows = await db.prepare(`
     SELECT ride_id, booking_id, booking_date, booking_time, booking_status, vehicle_type,
       pickup_location, drop_location, payment_method, booking_value
     FROM rides WHERE ${where}${searchClause}
@@ -343,14 +343,14 @@ export function getDashboardData(params: URLSearchParams) {
   }
 }
 
-export function getDrilldownData(params: URLSearchParams) {
-  const db = getDatabase()
-  const latestDate = String(db.prepare("SELECT value FROM metadata WHERE key = 'latest_date'").get()?.value ?? '')
+export async function getDrilldownData(params: URLSearchParams) {
+  const db = await getDatabase()
+  const latestDate = String((await db.prepare("SELECT value FROM metadata WHERE key = 'latest_date'").get())?.value ?? '')
   const rangeValue = params.get('range')
   const range: Range = isRange(rangeValue) ? rangeValue : DEFAULT_FILTERS.range
-  const vehicleOptions = (db.prepare(`SELECT DISTINCT ${VEHICLE_SQL} AS value FROM rides ORDER BY value`).all() as DatabaseRow[])
+  const vehicleOptions = (await db.prepare(`SELECT DISTINCT ${VEHICLE_SQL} AS value FROM rides ORDER BY value`).all() as DatabaseRow[])
     .map(row => String(row.value))
-  const paymentOptions = (db.prepare(`SELECT DISTINCT ${PAYMENT_SQL} AS value FROM rides ORDER BY value`).all() as DatabaseRow[])
+  const paymentOptions = (await db.prepare(`SELECT DISTINCT ${PAYMENT_SQL} AS value FROM rides ORDER BY value`).all() as DatabaseRow[])
     .map(row => String(row.value))
   const filters: Filters = {
     range,
@@ -397,8 +397,8 @@ export function getDrilldownData(params: URLSearchParams) {
   const page = Math.max(1, Math.min(100000, Number(params.get('page')) || 1))
   const level = DRILL_DIMENSIONS[path.length]
   if (!level) {
-    const rowCount = Number(db.prepare(`SELECT COUNT(*) AS count FROM rides WHERE ${where}`).get(...values)?.count ?? 0)
-    const records = db.prepare(`
+    const rowCount = Number((await db.prepare(`SELECT COUNT(*) AS count FROM rides WHERE ${where}`).get(...values))?.count ?? 0)
+    const records = await db.prepare(`
       SELECT ride_id, booking_id, booking_date, booking_time, booking_status, vehicle_type,
         pickup_location, drop_location, payment_method, booking_value
       FROM rides WHERE ${where} ORDER BY booking_date DESC, booking_time DESC, ride_id DESC
@@ -416,10 +416,10 @@ export function getDrilldownData(params: URLSearchParams) {
     status: STATUS_SQL,
     pembayaran: PAYMENT_SQL,
   } satisfies Record<DrillDimension, string>)[level]
-  const rowCount = Number(db.prepare(`
+  const rowCount = Number((await db.prepare(`
     SELECT COUNT(*) AS count FROM (SELECT ${expression} FROM rides WHERE ${where} GROUP BY ${expression})
-  `).get(...values)?.count ?? 0)
-  const groupRows = db.prepare(`
+  `).get(...values))?.count ?? 0)
+  const groupRows = await db.prepare(`
     SELECT ${expression} AS value, COUNT(*) AS total,
       SUM(CASE WHEN ${STATUS_SQL} = 'Selesai' THEN 1 ELSE 0 END) AS completed,
       SUM(CASE WHEN ${STATUS_SQL} = 'Selesai' THEN COALESCE(booking_value, 0) ELSE 0 END) AS revenue,
@@ -442,7 +442,7 @@ export function getDrilldownData(params: URLSearchParams) {
     })),
     rowCount,
     page,
-    totalRows: Number(db.prepare(`SELECT COUNT(*) AS count FROM rides WHERE ${where}`).get(...values)?.count ?? 0),
+    totalRows: Number((await db.prepare(`SELECT COUNT(*) AS count FROM rides WHERE ${where}`).get(...values))?.count ?? 0),
     latestDate,
   }
 }
